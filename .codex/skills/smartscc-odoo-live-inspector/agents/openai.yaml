@@ -1,0 +1,5 @@
+interface:
+  display_name: "SmartSCC Odoo Live Inspector"
+  short_description: "Inspect live Odoo schema safely"
+  default_prompt: "Use $smartscc-odoo-live-inspector to inspect an Odoo model and summarize what is known and unclear."
+

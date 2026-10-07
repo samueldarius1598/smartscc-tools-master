@@ -1,0 +1,4 @@
+interface:
+  display_name: "SmartSCC PCB Repair Collection Inspector"
+  short_description: "Inspect PCB repair collection rows and dialog state"
+  default_prompt: "Use $smartscc-pcb-repair-collection-inspector to inspect PCB Repair Collection rows, live dialog state, and holder or planned-line behavior."

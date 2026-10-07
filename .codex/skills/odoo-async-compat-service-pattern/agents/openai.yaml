@@ -1,0 +1,4 @@
+interface:
+  display_name: "Odoo Async Compat Pattern"
+  short_description: "Async Odoo service compatibility workflow"
+  default_prompt: "Use $odoo-async-compat-service-pattern to implement or fix an Odoo async service with schema fallbacks."

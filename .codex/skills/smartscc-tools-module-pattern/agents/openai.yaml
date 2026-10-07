@@ -1,0 +1,4 @@
+interface:
+  display_name: "Smart's CC Module Pattern"
+  short_description: "Pattern for Smart's CC GUI modules"
+  default_prompt: "Use $smartscc-tools-module-pattern to add or refactor a Smart's CC Tools Master module."

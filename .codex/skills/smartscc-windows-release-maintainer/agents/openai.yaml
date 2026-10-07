@@ -1,0 +1,4 @@
+interface:
+  display_name: "SmartsCC Windows Release Maintainer"
+  short_description: "Repo-specific Windows release and branding guidance"
+  default_prompt: "Use $smartscc-windows-release-maintainer to handle Smart's CC Tools Master Windows build or branding work."

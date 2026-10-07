@@ -1,0 +1,2 @@
+"""Shared Odoo service helpers."""
+

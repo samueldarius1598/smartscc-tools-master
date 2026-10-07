@@ -1,0 +1,6 @@
+openpyxl
+requests
+httpx
+rich
+tkcalendar
+Pillow
