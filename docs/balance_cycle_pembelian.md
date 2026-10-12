@@ -4,7 +4,7 @@
 **Mode**: Balance Cycle Pembelian (Purchase Cycle Balance Mode)
 **File utama**: `smartscc_tools/features/svl_fix_je/dashboard_service.py`, `smartscc_tools/modules/svl_fix_je_dashboard_page.py`, `smartscc_tools/features/svl_fix_je/models.py`
 **Terakhir dianalisis**: 2026-04-12
-**Terakhir diupdate**: 2026-10-05 — relokasi, koreksi GRNI/payment, dan aturan lima baris Case 9 yang dikonfirmasi pengguna serta guard projected clearing.
+**Terakhir diupdate**: 2026-10-12 — cakupan receipt dengan SVL bernilai tanpa jurnal/Bill dan pemulihan Case 5 dari PCB.
 
 > **Keputusan pengguna 2026-10-05:** downstream Case 9 dengan saldo HPP dan
 > Persediaan menggunakan lima baris: clearing nol dan selisih masuk akun HPP
@@ -56,6 +56,35 @@ Case 9 lima baris dan review wajib tidak berubah.
 - Draft **tidak** mengubah link SVL. Setelah posted, existing SVL ditautkan ke JE
   dan dibaca ulang; qty/value tidak diubah dan tidak membuat SVL baru. Reconcile
   suspense tetap manual di luar fitur ini. Preview dan payload execute tetap sama.
+
+## Receipt bernilai tanpa jurnal dan tanpa Bill — keputusan pengguna 2026-10-12
+
+- GR dengan SVL bernilai tetap masuk cycle meskipun seluruh jurnal siklus kosong.
+  Metadata produk/kategori dibaca dari stock move receipt juga, sehingga nama,
+  metode valuation, dan akun persediaan tidak bergantung pada adanya AML.
+- `raw_lines`, saldo akun, debit, dan kredit hanya berasal dari jurnal aktual.
+  Receipt tanpa jurnal mempunyai ledger kosong; SVL bukan baris jurnal pengganti.
+  Cycle tetap muncul di sidebar serta sheet Cycle Overview dan Item Detail.
+- Untuk receipt **Purchase-Backed**, valuation kategori **Automated**, SVL receipt
+  positif belum terhubung JE, tanpa Bill dan tanpa ledger siklus, item masuk
+  **Case 5 - Pemulihan SVL (Inventory - Suspense)** dan status cycle `problem`.
+  Ini pengecualian terhadap syarat Bill item-level Case 5; jumlah repair tetap
+  berasal dari existing SVL aktual, bukan PO atau current standard cost.
+- Kandidat PCB Repair Collection mempunyai dua line: Dr valuation kategori /
+  Cr `2103006` sebesar SVL aktual, dengan qty SVL pada kedua receipt legs.
+  Akun input kategori harus tepat `2103006`; akun/kategori yang belum cocok,
+  return, SVL tidak lengkap, atau jurnal existing menghasilkan plan Incomplete.
+  Tidak ada cost-change offset, selisih harga, atau pelunasan suspense sebelum Bill.
+- Row masuk **Needs Review**; review manual wajib sebelum execute. Execute membaca
+  ulang kategori, stock move, purchase line, SVL, dan JE yang terkait stock move
+  atau menyebut nomor receipt. Bill baru, JE/SVL link baru, source company/produk
+  berubah, atau akun kategori berbeda memblokir create dan meminta re-analyze.
+- Alur existing tetap berlaku: draft tidak relink; posting menautkan existing SVL
+  tanpa mengubah qty/value atau membuat layer baru. Retry memakai JE yang cocok.
+  Saldo suspense setelah pemulihan menunggu Bill dan reconcile tetap manual.
+- **Case 10** tetap follow-up Bill bila tidak ada kebutuhan pemulihan receipt ini.
+  Ketiadaan Bill tidak boleh menutupi Case 5 yang mempunyai bukti JE receipt hilang.
+  Valuation Manual tidak diberi default repair receipt tanpa Bill.
 
 ## Ringkasan
 
@@ -1219,6 +1248,10 @@ Guard ini mencegah jurnal koreksi terbalik dan menghindari kasus nilai menjadi d
   - `stj_state` missing actual SVL / missing zero SVL / correction-only, bukan direct
   - Bill item-level kena `2103006` untuk Case 5 atau akun expense untuk Case 6
   - nilai SVL aktual wajib tersedia untuk plan executable; evidence kosong tetap Incomplete
+- Pengecualian Case 5 tanpa Bill: receipt Purchase-Backed dengan Automated valuation,
+  actual SVL positif unlinked, dan ledger kosong mengikuti aturan receipt tanpa
+  jurnal di atas. Plan hanya dua receipt legs; tidak perlu saldo suspense debit
+  atau source AML Bill untuk membentuk kandidat ini.
 - Item yang hanya punya STJ tanpa bill **tidak** dibuat row repair Case 3/4
 - Jika cycle-level problem masih ada tetapi seluruh item gagal gate di atas, final grouping cycle fallback ke `case_lainnya`
 - Khusus cycle `case3/case4-like` yang gagal gate hanya karena belum punya evidence STJ/clearing, builder tetap boleh membuat row **bill-only candidate** dengan metadata:

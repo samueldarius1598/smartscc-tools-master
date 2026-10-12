@@ -59,7 +59,24 @@ Gunakan Settings > Database Profiles untuk menentukan database dan pilihan
 Follow Global Default pada modul; pastikan database yang efektif sebelum aksi
 yang menulis transaksi.
 
+## Menarik laporan Excel PCB
+
+Ikuti [panduan ekstraksi PCB](pcb_report_export.md) untuk memilih tool resmi
+`purchase_cycle_bill_report`, menyiapkan fallback lokal, memastikan company dan
+filter tanggal, serta memeriksa hasil Excel. PCB adalah Purchase Cycle Balance
+(Balance Cycle Pembelian). Ekstraksi laporan ini hanya membaca data.
+
+MCP Smart's CC merupakan layanan eksternal dan tidak otomatis tersedia setelah
+clone. Jika MCP tidak terhubung, gunakan app atau service/exporter yang disertakan
+repo dengan konfigurasi GAS/Odoo lokal. Panduan juga menjelaskan perbedaan
+exporter saat ini dengan script standalone lama di root.
+
 ## Memodifikasi bersama AI Agent
+
+Untuk New JE + Relink SVL melalui source repo tanpa GUI atau MCP, gunakan
+`python main.py svl-new-je-relink`. Baca
+[panduan CLI](svl_new_je_relink_cli.md) untuk preview, persetujuan rencana,
+apply, serta penanganan hasil parsial. Akses GAS/Odoo lokal tetap diperlukan.
 
 Mulai dari `AGENTS.md`, `README.md`, dan dokumentasi fitur yang diubah. Skill
 repo tersedia di `.codex/skills/`. Path absolut yang menunjuk komputer pemilik

@@ -20,6 +20,10 @@ def main(argv: list[str] | None = None) -> int:
         from smartscc_tools.features.svl_fix_je.dashboard_gui_cli import main as dashboard_gui_cli_main
 
         return dashboard_gui_cli_main(args[1:])
+    if args[0].strip().lower() == "svl-new-je-relink":
+        from smartscc_tools.features.svl_fix_je.new_je_relink_cli import main as relink_cli_main
+
+        return relink_cli_main(args[1:])
     from smartscc_tools.features.item_journal.entrypoints import cli
     return cli.main(args)
 

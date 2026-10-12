@@ -1,6 +1,8 @@
 ## GitHub clone dan AI Agent di komputer lain
 
 - Baca [docs/github_handoff.md](docs/github_handoff.md) untuk setup clone, credential lokal, dan alur perubahan.
+- Untuk menarik laporan Excel PCB, ikuti [docs/pcb_report_export.md](docs/pcb_report_export.md): gunakan MCP `purchase_cycle_bill_report` bila tersedia, atau exporter company-level bawaan repo; panduan mencakup fallback tanpa GUI dan perilaku tanggal CLI.
+- Untuk New JE + Relink SVL tanpa GUI, gunakan CLI repo `python main.py svl-new-je-relink` sesuai [docs/svl_new_je_relink_cli.md](docs/svl_new_je_relink_cli.md). Default hanya preview; `--apply --preview-json` menjalankan rencana yang sudah disetujui. Fitur ini tidak membutuhkan server MCP eksternal.
 - Untuk clone GitHub, root proyek adalah folder checkout yang berisi file ini. Path absolut pemilik di bawah hanya menjelaskan instalasi pemilik; jangan membuat ulang path tersebut atau junction di komputer lain.
 - Source, tests, docs, aset aplikasi, dan skill `.codex/skills/` berada dalam repo. Memori `C:/Users/User/.ai-shared/`, skill global pemilik, dan repo referensi Odoo adalah referensi eksternal opsional pada komputer lain; gunakan dokumentasi repo bila tidak tersedia. Jangan menganggap referensi eksternal itu sudah dibaca.
 - API key GAS harus disediakan per komputer melalui `SMARTSCC_GAS_API_KEY` atau `%APPDATA%/smartscc_tools/gas_api_key.txt`. Jangan commit credential, workbook kerja, hasil ekspor, atau log produksi.

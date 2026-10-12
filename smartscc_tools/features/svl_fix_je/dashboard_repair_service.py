@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date
 import inspect
 import logging
+import math
 from typing import Any
 
 from smartscc_tools.services.odoo.gateway import build_company_context
@@ -54,6 +55,16 @@ class ResolvedJournal:
     name: str
 
 
+@dataclass
+class SvlNewJeRelinkPlan:
+    database: str
+    row: SvlDashboardRepairRow
+    debit_account: ResolvedAccount
+    credit_account: ResolvedAccount
+    journal: ResolvedJournal
+    source_state: dict[str, Any]
+
+
 class RepairOperationError(RuntimeError):
     def __init__(self, error_kind: str, message: str) -> None:
         super().__init__(message)
@@ -78,6 +89,129 @@ class SvlDashboardRepairServiceAsync:
         self._pcb_case1_reconcile_locks: dict[str, asyncio.Lock] = {}
         self._partner_cache: dict[tuple[int, str], int] = {}
         self._partner_exact_prefetch_misses: set[tuple[int, str]] = set()
+
+    async def prepare_new_je_relink(self, row: SvlDashboardRepairRow, *, database: str) -> SvlNewJeRelinkPlan:
+        """Read-only preflight for the headless New JE + Relink SVL action."""
+        if row.company_id <= 0 or row.svl_id <= 0:
+            raise RepairOperationError("invalid_input", "company_id dan svl_id wajib positif.")
+        if row.posting_mode not in {"draft", "post"}:
+            raise RepairOperationError("invalid_input", "Posting harus draft atau post.")
+        if not row.reference.strip() or not row.line_label.strip():
+            raise RepairOperationError("invalid_input", "Reference dan Label Line wajib diisi.")
+        target_date = self._parse_date(row.date)
+        context = build_company_context(row.company_id)
+        await self.rpc.ensure_login()
+        svl_meta = await self._fields_get_cached("stock.valuation.layer")
+        required = {"company_id", "product_id", "value", "account_move_id"}
+        if not required.issubset(svl_meta):
+            raise RepairOperationError("schema", "Field company/product/value/account_move_id SVL tidak lengkap.")
+        fields = ["id", *sorted(required), *[f for f in ("stock_move_id", "reference", "description", "quantity", "write_date") if f in svl_meta]]
+        rows = await self.rpc.read("stock.valuation.layer", [row.svl_id], fields=fields, context=context)
+        if not rows or self._many2one_id(rows[0].get("company_id")) != row.company_id:
+            raise RepairOperationError("svl_scope", "SVL tidak ditemukan pada company yang diminta.")
+        svl = rows[0]
+        value = float(svl.get("value") or 0.0)
+        if not math.isfinite(value) or value == 0:
+            raise RepairOperationError("svl_value", "Nilai SVL harus finite dan tidak nol.")
+        product_id = self._many2one_id(svl.get("product_id"))
+        products = await self.rpc.read("product.product", [product_id], fields=["id", "name", "default_code"], context=context)
+        if not products:
+            raise RepairOperationError("product", "Produk SVL tidak ditemukan.")
+        product = products[0]
+        move_meta = await self._fields_get_cached("account.move")
+        if not {"company_id", "line_ids", "name", "state", "ref"}.issubset(move_meta):
+            raise RepairOperationError("schema", "Field journal untuk validasi existing JE tidak lengkap.")
+        move_fields = ["id", "name", "state", "company_id", "line_ids", "ref"]
+        old_move_id = self._many2one_id(svl.get("account_move_id"))
+        old_move: dict[str, Any] = {}
+        if old_move_id:
+            existing = await self.rpc.read("account.move", [old_move_id], fields=move_fields, context=context)
+            if not existing or self._many2one_id(existing[0].get("company_id")) != row.company_id:
+                raise RepairOperationError("existing_scope", "Existing JE tidak ditemukan pada company ini.")
+            old_move = existing[0]
+            if old_move.get("line_ids"):
+                raise RepairOperationError("existing_je", f"SVL sudah terhubung ke JE berisi line: {old_move.get('name')}.")
+
+        # Also reject a populated valuation JE whose SVL link is missing.
+        stock_move_id = self._many2one_id(svl.get("stock_move_id"))
+        linked_ids: set[int] = set()
+        if stock_move_id:
+            stock_meta = await self._fields_get_cached("stock.move")
+            stock_fields = ["id", *[f for f in ("account_move_ids", "company_id") if f in stock_meta]]
+            stock_rows = await self.rpc.read("stock.move", [stock_move_id], fields=stock_fields, context=context)
+            if not stock_rows or ("company_id" in stock_meta and self._many2one_id(stock_rows[0].get("company_id")) != row.company_id):
+                raise RepairOperationError("stock_scope", "Stock move SVL tidak ditemukan pada company ini.")
+            linked_ids.update(int(mid) for mid in stock_rows[0].get("account_move_ids", []) if int(mid) > 0)
+            if "stock_move_id" in move_meta:
+                linked = await self.rpc.search_read("account.move", [("company_id", "=", row.company_id), ("stock_move_id", "=", stock_move_id)], fields=move_fields, context=context)
+                linked_ids.update(int(move["id"]) for move in linked)
+            siblings = await self.rpc.search_read("stock.valuation.layer", [("company_id", "=", row.company_id), ("stock_move_id", "=", stock_move_id)], fields=["account_move_id"], context=context)
+            linked_ids.update(self._many2one_id(layer.get("account_move_id")) for layer in siblings)
+        linked_ids.discard(0)
+        linked_ids.discard(old_move_id)
+        if linked_ids:
+            linked_rows = await self.rpc.read("account.move", sorted(linked_ids), fields=move_fields, context=context)
+            if len(linked_rows) != len(linked_ids) or any(move.get("line_ids") for move in linked_rows):
+                raise RepairOperationError("existing_je", "Stock move sudah memiliki JE lain; review link existing sebelum membuat JE baru.")
+
+        marker = f"[SVL-NEW-JE:{row.svl_id}]"
+        previous = await self.rpc.search_read("account.move", [("company_id", "=", row.company_id), ("ref", "ilike", marker)], fields=move_fields, limit=1, context=context)
+        if previous:
+            raise RepairOperationError("previous_attempt", f"JE dari percobaan sebelumnya ditemukan: {previous[0].get('name')} (ID {previous[0]['id']}). Review JE tersebut sebelum retry.")
+        debit = await self.resolve_account(company_id=row.company_id, code=row.debit_account_code)
+        credit = await self.resolve_account(company_id=row.company_id, code=row.credit_account_code)
+        journal = await self.resolve_journal(company_id=row.company_id, code=row.journal_code or DEFAULT_JOURNAL_CODE)
+        if not debit or not credit or debit.account_id == credit.account_id:
+            raise RepairOperationError("accounts", "Akun debit/kredit harus tersedia pada company dan berbeda.")
+        if not journal:
+            raise RepairOperationError("journal", "Journal tidak ditemukan pada company ini.")
+        # Check the company lock even for Draft Only; do not prepare a locked-date write.
+        await self._ensure_postable_date(company_id=row.company_id, target_date=target_date)
+        source_ref = normalize_text(svl.get("reference") or svl.get("description"))
+        reference = row.reference if marker in row.reference else " / ".join(filter(None, [row.reference, source_ref, marker]))
+        prepared = replace(row, item_product_id=product_id, item_code=normalize_text(product.get("default_code")),
+                           item_name=normalize_text(product.get("name")), amount=abs(value), signed_amount=value,
+                           date=target_date.isoformat(), reference=reference, svl_reference=source_ref,
+                           move_id=old_move_id, move_name=normalize_text(old_move.get("name")),
+                           move_state=normalize_text(old_move.get("state")), target_mode="new_and_relink",
+                           repair_source_kind="svl_linked_empty_move" if old_move_id else "svl_no_move")
+        return SvlNewJeRelinkPlan(database, prepared, debit, credit, journal,
+                                  {"svl": svl, "product": product, "old_move": old_move, "linked_ids": sorted(linked_ids)})
+
+    async def execute_new_je_relink(self, approved: SvlNewJeRelinkPlan) -> SvlDashboardRepairBatchResult:
+        """Re-read the approved source state immediately before the existing repair flow."""
+        fresh = await self.prepare_new_je_relink(approved.row, database=approved.database)
+        if asdict(fresh) != asdict(approved):
+            raise RepairOperationError("preview_changed", "Data/config berubah sejak preview. Buat dan review preview baru.")
+        result = await self.execute(SvlDashboardRepairRequest(database=approved.database, rows=[fresh.row], max_workers=1))
+        if result.error_count:
+            return result
+        created = result.results[0]
+        context = build_company_context(fresh.row.company_id)
+        try:
+            layers = await self.rpc.read("stock.valuation.layer", [fresh.row.svl_id], fields=["account_move_id"], context=context)
+            moves = await self.rpc.read("account.move", [created.move_id], fields=["company_id", "journal_id", "state", "date"], context=context)
+            lines = await self.rpc.search_read("account.move.line", [("move_id", "=", created.move_id)], fields=["account_id", "product_id", "debit", "credit"], context=context)
+            actual = sorted((self._many2one_id(line.get("account_id")), self._many2one_id(line.get("product_id")),
+                             round(float(line.get("debit") or 0), 2), round(float(line.get("credit") or 0), 2)) for line in lines)
+            amount = round(fresh.row.amount, 2)
+            expected = sorted([(fresh.debit_account.account_id, fresh.row.item_product_id, amount, 0.0),
+                               (fresh.credit_account.account_id, fresh.row.item_product_id, 0.0, amount)])
+            valid = (len(layers) == len(moves) == 1
+                     and self._many2one_id(layers[0].get("account_move_id")) == created.move_id
+                     and self._many2one_id(moves[0].get("company_id")) == fresh.row.company_id
+                     and self._many2one_id(moves[0].get("journal_id")) == fresh.journal.journal_id
+                     and moves[0].get("date") == fresh.row.date
+                     and moves[0].get("state") == ("posted" if fresh.row.posting_mode == "post" else "draft")
+                     and actual == expected)
+        except Exception as exc:
+            raise RepairOperationError("verify_failed", f"JE {created.move_name} (ID {created.move_id}) sudah dibuat; verifikasi gagal: {exc}. Review existing JE sebelum retry.") from exc
+        if not valid:
+            created.status = "ERROR"
+            created.error_kind = "verify_failed"
+            created.message = f"JE {created.move_name} (ID {created.move_id}) sudah dibuat; link/header/lines berbeda dari preview. Review existing JE sebelum retry."
+            result.error_count += 1
+        return result
 
     async def resolve_account(self, *, company_id: int, code: str) -> ResolvedAccount | None:
         clean_code = normalize_text(code)
@@ -2877,6 +3011,7 @@ class SvlDashboardRepairServiceAsync:
             or self._many2one_id(r.get("product_id")) != row.product_id
             or self._many2one_id(r.get("stock_move_id")) not in set(evidence.get("stock_move_ids", []))
             or self._many2one_id(r.get("account_move_id")) not in {0, int(allowed_move_id)}
+            or not math.isfinite(float(r.get("quantity") or 0)) or not math.isfinite(float(r.get("value") or 0))
             or float(r.get("quantity") or 0) <= 0 or float(r.get("value") or 0) <= 0
             for r in layers
         ):
@@ -2892,6 +3027,71 @@ class SvlDashboardRepairServiceAsync:
         receipt_counterpart = [l for l in row.planned_lines if l.role == "receipt_counterpart"]
         if len(receipt_inventory) != 1 or len(receipt_counterpart) != 1 or receipt_inventory[0].side != "debit" or receipt_inventory[0].account_code != row.inventory_account_code or abs(receipt_inventory[0].amount-value) >= .01 or receipt_counterpart[0].side != "credit" or abs(receipt_counterpart[0].amount-value) >= .01:
             raise RepairOperationError("receipt_recovery_blocked", "Dua receipt legs harus mempertahankan akun, nilai dan qty SVL aktual.")
+        if evidence.get("without_bill"):
+            if row.pcb_case != "case5" or row.bill_move_id or row.bill_line_id or len(row.planned_lines) != 2 or receipt_counterpart[0].account_code != "2103006":
+                raise RepairOperationError("receipt_recovery_blocked", "Receipt tanpa Bill hanya memulihkan Inventory - Suspense dalam dua line.")
+            from .dashboard_service import SvlDashboardServiceAsync
+
+            products = await self.rpc.read("product.product", [row.product_id], fields=["id", "categ_id"], context=context, stage="PCB_RECEIPT_CATEGORY")
+            category_id = self._many2one_id((products[0] if len(products) == 1 else {}).get("categ_id"))
+            category_meta = await self._fields_get_cached("product.category")
+            input_specs = [spec for spec in SvlDashboardServiceAsync._detect_category_account_specs(category_meta) if spec["role"] == "input"]
+            if not category_id or not input_specs or not {"property_valuation", "property_stock_valuation_account_id"}.issubset(category_meta):
+                raise RepairOperationError("receipt_recovery_blocked", "Schema/kategori receipt belum cukup untuk validasi akun.")
+            categories = await self.rpc.read("product.category", [category_id], fields=["id", "property_valuation", "property_stock_valuation_account_id", *(s["field_name"] for s in input_specs)], context=context, stage="PCB_RECEIPT_CATEGORY")
+            category = categories[0] if len(categories) == 1 else {}
+            input_id = next((self._many2one_id(category.get(s["field_name"])) for s in input_specs if self._many2one_id(category.get(s["field_name"]))), 0)
+            inventory_account = await self.resolve_account(company_id=row.company_id, code=row.inventory_account_code)
+            input_account = await self.resolve_account(company_id=row.company_id, code="2103006")
+            if category.get("property_valuation") != "real_time" or not inventory_account or not input_account or inventory_account.account_id != self._many2one_id(category.get("property_stock_valuation_account_id")) or input_account.account_id != input_id:
+                raise RepairOperationError("receipt_recovery_changed", "Valuation/input kategori berubah atau bukan Automated Inventory - Suspense; re-analyze.")
+            stock_ids = sorted({self._many2one_id(layer.get("stock_move_id")) for layer in layers})
+            stock_fields = ["id", "company_id", "product_id", "picking_id", "purchase_line_id", "state", "account_move_ids"]
+            stock_meta = await self._fields_get_cached("stock.move")
+            if not set(stock_fields).issubset(stock_meta):
+                raise RepairOperationError("receipt_recovery_blocked", "Schema stock move belum cukup untuk memastikan JE penerimaan kosong.")
+            stocks = await self.rpc.read("stock.move", stock_ids, fields=stock_fields, context=context, stage="PCB_RECEIPT_STOCK_PREFLIGHT")
+            if {int(s["id"]) for s in stocks} != set(stock_ids) or any(
+                self._many2one_id(s.get("company_id")) != row.company_id
+                or self._many2one_id(s.get("product_id")) != row.product_id
+                or self._many2one_id(s.get("picking_id")) != row.picking_id
+                or s.get("state") != "done"
+                or {int(v) for v in (s.get("account_move_ids") or [])} - {int(allowed_move_id)}
+                for s in stocks
+            ):
+                raise RepairOperationError("receipt_recovery_changed", "Stock move berubah atau JE penerimaan sudah ada; re-analyze.")
+            purchase_ids = sorted({self._many2one_id(s.get("purchase_line_id")) for s in stocks} - {0})
+            if not purchase_ids or any(not self._many2one_id(s.get("purchase_line_id")) for s in stocks):
+                raise RepairOperationError("receipt_recovery_blocked", "Purchase line receipt belum terverifikasi.")
+            purchases = await self.rpc.read("purchase.order.line", purchase_ids, fields=["id", "company_id", "product_id", "order_id", "invoice_lines"], context=context, stage="PCB_RECEIPT_PO_PREFLIGHT")
+            if {int(p["id"]) for p in purchases} != set(purchase_ids) or any(
+                self._many2one_id(p.get("company_id")) != row.company_id
+                or self._many2one_id(p.get("product_id")) != row.product_id
+                or p.get("invoice_lines") for p in purchases
+            ):
+                raise RepairOperationError("receipt_recovery_changed", "Bill sudah tersedia atau purchase line berubah; re-analyze.")
+            order_ids = sorted({self._many2one_id(p.get("order_id")) for p in purchases} - {0})
+            if not order_ids or any(not self._many2one_id(p.get("order_id")) for p in purchases):
+                raise RepairOperationError("receipt_recovery_blocked", "PO receipt belum terverifikasi.")
+            orders = await self.rpc.read("purchase.order", order_ids, fields=["id", "name", "company_id", "invoice_ids"], context=context, stage="PCB_RECEIPT_PO_PREFLIGHT")
+            if {int(o["id"]) for o in orders} != set(order_ids) or any(self._many2one_id(o.get("company_id")) != row.company_id or o.get("invoice_ids") or not o.get("name") for o in orders):
+                raise RepairOperationError("receipt_recovery_changed", "PO berubah atau sudah mempunyai Bill; re-analyze.")
+            bills = await self.rpc.search_read("account.move", [["company_id", "=", row.company_id], ["move_type", "in", ["in_invoice", "in_refund"]], ["state", "!=", "cancel"], ["invoice_origin", "in", [o["name"] for o in orders]]], fields=["id"], limit=1, context=context, stage="PCB_RECEIPT_BILL_ORIGIN_PREFLIGHT")
+            if bills:
+                raise RepairOperationError("receipt_recovery_changed", "Bill dengan origin PO sudah tersedia; re-analyze.")
+            move_meta = await self._fields_get_cached("account.move")
+            relation_domain = [["stock_move_id", "in", stock_ids]] if "stock_move_id" in move_meta else []
+            if "ref" in move_meta and row.picking_name:
+                relation_domain = (["|"] if relation_domain else []) + relation_domain + [["ref", "ilike", row.picking_name]]
+            if not relation_domain:
+                raise RepairOperationError("receipt_recovery_blocked", "Schema journal belum cukup untuk memeriksa JE existing.")
+            linked_layers = await self.rpc.search_read("stock.valuation.layer", [["company_id", "=", row.company_id], ["stock_move_id", "in", stock_ids], ["account_move_id", "!=", False], ["account_move_id", "!=", int(allowed_move_id)]], fields=["id"], limit=1, context=context, stage="PCB_RECEIPT_SIBLING_PREFLIGHT")
+            if linked_layers:
+                raise RepairOperationError("receipt_recovery_changed", "SVL receipt lain sudah memiliki JE; review sebelum membuat JE baru.")
+            existing = await self.rpc.search_read("account.move", [["company_id", "=", row.company_id], ["id", "!=", int(allowed_move_id)], *relation_domain], fields=["id", "name"], limit=1, context=context, stage="PCB_RECEIPT_JE_PREFLIGHT")
+            if existing:
+                raise RepairOperationError("receipt_recovery_changed", "JE receipt existing ditemukan; review sebelum membuat JE baru.")
+            return ids
         if not row.bill_line_id:
             raise RepairOperationError("receipt_recovery_blocked", "Bill source harus unik dan terverifikasi.")
         bill = await self.rpc.read("account.move.line", [row.bill_line_id], fields=["id", "move_id", "company_id", "product_id", "account_id", "balance", "amount_residual"], context=context, stage="PCB_RECEIPT_BILL_PREFLIGHT")

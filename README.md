@@ -129,6 +129,19 @@ python main.py migrate-audit --input \"logs\\audit_legacy.jsonl\" --output \"log
 - Pilihan per module selalu menyertakan `Follow Global Default`.
 - Settings menyediakan `Use GAS Default` sebagai global default bawaan, plus daftar profile editable dengan format label `Alias - Database [Note]`.
 
+## New JE + Relink SVL tanpa GUI
+
+Tool tersedia langsung dari source setelah konfigurasi GAS/Odoo lokal:
+
+```cmd
+call .venv\Scripts\activate.bat
+python main.py svl-new-je-relink --help
+```
+
+Ikuti [panduan preview dan apply](docs/svl_new_je_relink_cli.md). Preview membaca
+SVL dan memvalidasi company, akun, existing JE, serta lock date; apply memakai
+file preview yang disetujui dan memeriksa ulang hasil. Tidak perlu server MCP.
+
 ## Handoff Notes
 - Untuk sesi baru yang melanjutkan mode dashboard `Saldo Akun per Item`, baca dulu [docs/svl_fix_je_account_balance_handoff.md](docs/svl_fix_je_account_balance_handoff.md).
 

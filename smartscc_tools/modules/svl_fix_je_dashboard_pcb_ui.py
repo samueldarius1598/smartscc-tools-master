@@ -3840,6 +3840,8 @@ def _pcb_case2_guard_required(seed: dict[str, Any]) -> bool:
 def _pcb_case2_guard_reason_preview(seed: dict[str, Any]) -> str:
     trigger_kind = SvlFixJeDashboardPage._pcb_case2_guard_trigger_kind(seed)
     guard_messages = [normalize_text(value) for value in list(seed.get("guard_messages") or []) if normalize_text(value)]
+    if dict(seed.get("case_evidence") or {}).get("flow") == "normal_receipt" and guard_messages:
+        return guard_messages[0]
     if trigger_kind == "missing_repair_basis":
         matched_message = next(
             (

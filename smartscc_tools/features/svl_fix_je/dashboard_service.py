@@ -2630,7 +2630,7 @@ class SvlDashboardServiceAsync:
             f"[BENCH]   trace: {(perf_counter() - trace_started) * 1000.0:.0f}ms | "
             f"{len(relevant_move_ids)} moves | {len(picking_rows_by_id)} pickings"
         )
-        if not relevant_move_ids or not picking_rows_by_id:
+        if not picking_rows_by_id:
             self._log(
                 f"[BENCH] purchase_cycle_balance total: {(perf_counter() - bench_started) * 1000.0:.0f}ms | no cycles"
             )
@@ -2720,6 +2720,10 @@ class SvlDashboardServiceAsync:
         product_ids_for_raw = sorted({
             _many2one_id(r.get("product_id"))
             for r in all_ledger_rows
+            if _many2one_id(r.get("product_id")) > 0
+        } | {
+            _many2one_id(r.get("product_id"))
+            for r in (trace.get("stock_move_rows_by_id") or {}).values()
             if _many2one_id(r.get("product_id")) > 0
         })
         product_info_started = perf_counter()
@@ -2910,6 +2914,8 @@ class SvlDashboardServiceAsync:
                 "valuation_account_id": 0,
                 "valuation_account_code": "",
                 "valuation_account_name": "",
+                "valuation_method": "",
+                "input_account_code": "",
                 "expense_account_id": 0,
                 "expense_account_code": "",
                 "expense_account_name": "",
@@ -2934,9 +2940,12 @@ class SvlDashboardServiceAsync:
                 for spec in category_account_specs
                 if normalize_text(spec.get("role")) == "expense"
             ]
+            input_specs = [spec for spec in category_account_specs if spec.get("role") == "input"]
             category_rows: list[dict[str, Any]] = []
             category_read_fields = list(
-                dict.fromkeys(["name", "property_stock_valuation_account_id", *(spec["field_name"] for spec in expense_specs)])
+                dict.fromkeys(["name", "property_stock_valuation_account_id",
+                    *(["property_valuation"] if "property_valuation" in category_fields else []),
+                    *(spec["field_name"] for spec in [*expense_specs, *input_specs])])
             )
             category_rows.extend(
                 await self._read_in_chunks(
@@ -2958,7 +2967,7 @@ class SvlDashboardServiceAsync:
                 | {
                     _many2one_id(row.get(spec["field_name"]))
                     for row in category_rows
-                    for spec in expense_specs
+                    for spec in [*expense_specs, *input_specs]
                     if _many2one_id(row.get(spec["field_name"])) > 0
                 }
                 | {
@@ -2979,11 +2988,20 @@ class SvlDashboardServiceAsync:
             categ_name_map: dict[int, str] = {}
             valuation_by_category_id: dict[int, dict[str, Any]] = {}
             expense_by_category_id: dict[int, dict[str, Any]] = {}
+            input_by_category_id: dict[int, str] = {}
+            valuation_method_by_category_id: dict[int, str] = {}
             for row in category_rows:
                 cid = int(row.get("id") or 0)
                 if cid <= 0:
                     continue
                 categ_name_map[cid] = normalize_text(row.get("name")) or ""
+                valuation_method_by_category_id[cid] = {
+                    "real_time": "automated", "manual_periodic": "manual",
+                }.get(normalize_text(row.get("property_valuation")), "")
+                input_by_category_id[cid] = next((
+                    normalize_text((resolved_account_info_map.get(_many2one_id(row.get(spec["field_name"]))) or {}).get("code")).upper()
+                    for spec in input_specs if _many2one_id(row.get(spec["field_name"])) > 0
+                ), "")
                 valuation_account_id = _many2one_id(row.get("property_stock_valuation_account_id"))
                 if valuation_account_id > 0:
                     valuation_info = resolved_account_info_map.get(valuation_account_id, {})
@@ -3009,6 +3027,8 @@ class SvlDashboardServiceAsync:
                     break
             for pid, pid_data in result.items():
                 cid = int(pid_data.get("categ_id") or 0)
+                pid_data["valuation_method"] = valuation_method_by_category_id.get(cid, "")
+                pid_data["input_account_code"] = input_by_category_id.get(cid, "")
                 if cid in categ_name_map:
                     pid_data["categ_name"] = categ_name_map[cid]
                 valuation_data = valuation_by_category_id.get(cid) or {}
@@ -3620,6 +3640,7 @@ class SvlDashboardServiceAsync:
                 and float(row.get("value") or 0) > 0 and not _many2one_id(row.get("account_move_id"))]
             item.receipt_recovery_evidence = {
                 "flow": "normal_receipt", "stock_move_ids": move_ids, "has_return": bool(cycle.has_return_picking),
+                "without_bill": not bool(cycle.bill_move_ids),
                 "missing_svl_ids": sorted({int(row["id"]) for row in missing}),
                 "missing_value": _round2(sum(float(row.get("value") or 0) for row in missing)),
                 "missing_qty": sum(float(row.get("quantity") or 0) for row in missing),
@@ -4298,9 +4319,16 @@ class SvlDashboardServiceAsync:
             abs(_round2(case9_evidence.get("value_gap"))) >= 0.01
             and abs(_round2(case9_evidence.get("correction_amount") or case9_evidence.get("value_gap"))) >= 0.01
         )
+        unbilled_receipt_missing_je = (
+            stj_state == "missing_actual_svl"
+            and not cycle.bill_move_ids
+            and not cycle.raw_lines
+            and cycle.document_classification == _PCB_DOCUMENT_CLASS_PURCHASE_BACKED
+            and normalize_text(product_info.get("valuation_method")) == "automated"
+        )
         # GRNI balances alone are not repair evidence. Return/SVL and PO-UoM
         # evidence can independently prove Case 8/9 before a vendor bill exists.
-        if not has_exact_bill_for_item and not (has_return_value_gap or has_uom_value_gap):
+        if not has_exact_bill_for_item and not (has_return_value_gap or has_uom_value_gap or unbilled_receipt_missing_je):
             return {
                 "primary_case": "",
                 "primary_group": "",
@@ -4342,6 +4370,12 @@ class SvlDashboardServiceAsync:
                 f"UoM PO/Bill {source_uom} tidak inline dengan product/SVL {product_uom}; "
                 f"scale factor {scale_factor:,.2f}x membuat value SVL tidak wajar."
             )
+        elif unbilled_receipt_missing_je:
+            primary_case = "case5"
+            recovery = dict(getattr(item_row, "receipt_recovery_evidence", {}) or {})
+            repair_basis_source = "actual_missing_receipt_svl"
+            repair_basis_amount = _round2(recovery.get("missing_value"))
+            case_reason = "SVL penerimaan bernilai tetapi JE belum ada; pulihkan Inventory - Suspense. Bill belum tersedia."
         elif (
             stj_state in {"missing_zero_svl", "missing_actual_svl", "correction_only"}
             and bill_hit_role == "suspend"
@@ -4487,6 +4521,7 @@ class SvlDashboardServiceAsync:
         _cycle_bill_move_ids = [int(v or 0) for v in (getattr(cycle, "bill_move_ids", None) or []) if int(v or 0) > 0]
         if (
             not _cycle_bill_move_ids
+            and not case_counts.get("case5")
             and not bool(getattr(cycle, "partner_is_intercompany", False))
             and normalize_text(getattr(cycle, "document_classification", "")) == _PCB_DOCUMENT_CLASS_PURCHASE_BACKED
         ):
@@ -6842,6 +6877,11 @@ class SvlDashboardServiceAsync:
         purchase_order_rows_by_id = dict(trace.get("purchase_order_rows_by_id") or {})
         purchase_line_rows_by_id = dict(trace.get("purchase_line_rows_by_id") or {})
         stock_move_rows_by_id = dict(trace.get("stock_move_rows_by_id") or {})
+        valued_svl_picking_ids = {
+            _many2one_id((stock_move_rows_by_id.get(int(move_id)) or {}).get("picking_id"))
+            for move_id, layers in (trace.get("svl_rows_by_stock_move_id") or {}).items()
+            if any(abs(_round2(layer.get("value"))) >= 0.01 for layer in layers)
+        }
         stock_move_indexes = self._get_pcb_stock_move_indexes(trace)
         stock_move_ids_by_picking_id: dict[int, set[int]] = {
             int(key): {int(value or 0) for value in values if int(value or 0) > 0}
@@ -7269,7 +7309,8 @@ class SvlDashboardServiceAsync:
                 | bank_move_ids
                 | set(cycle_correction_move_ids)
             )
-            if not all_cycle_move_ids:
+            # SVL evidence keeps an unjournaled receipt visible; ledger rows remain actual AML only.
+            if not all_cycle_move_ids and not valued_svl_picking_ids.intersection(group_picking_ids):
                 continue
 
             # ── Proportional allocation for shared batch payments ─────────────
@@ -7421,7 +7462,7 @@ class SvlDashboardServiceAsync:
             # Build SvlDashboardCycleItemRow list
             item_rows: list[SvlDashboardCycleItemRow] = []
             for pid in product_ids_in_picking:
-                p_name = product_name_map.get(pid, f"Product #{pid}")
+                p_name = product_name_map.get(pid) or (product_info_map.get(pid) or {}).get("name") or f"Product #{pid}"
                 item_acct_rows: list[SvlDashboardCycleAccountRow] = []
                 for acct_id, bucket in sorted(item_buckets.get(pid, {}).items()):
                     info = account_info_map.get(acct_id, {})
@@ -7451,7 +7492,8 @@ class SvlDashboardServiceAsync:
                     product_id=pid,
                     product_name=p_name,
                     default_code=normalize_text((product_info_map.get(pid) or {}).get("default_code")),
-                    valuation_method="automated" if item_inv_value.get(pid, 0.0) > 0.01 else "manual",
+                    valuation_method=(product_info_map.get(pid) or {}).get("valuation_method") or
+                        ("automated" if item_inv_value.get(pid, 0.0) > 0.01 else "manual"),
                     standard_price=_round2((product_info_map.get(pid) or {}).get("standard_price")),
                     svl_zero_at_gr=abs(_round2(item_inv_value.get(pid, 0.0))) < 0.01,
                     account_rows=item_acct_rows,
@@ -9028,18 +9070,18 @@ class SvlDashboardServiceAsync:
     def _build_pcb_case5_planned_lines(
         cls, *, problem_balances_by_code, expense_account_code, expense_account_name,
         basis_amount, valuation_account_code="", valuation_account_name="",
-        standard_amount=0.0, line_label="",
+        standard_amount=0.0, line_label="", receipt_only=False,
     ) -> list[SvlDashboardPcbRepairPlannedLine]:
         value = _round2(basis_amount)
         suspense = _round2(problem_balances_by_code.get("2103006", 0.0))
-        if value <= 0 or suspense <= 0 or not valuation_account_code:
+        if value <= 0 or (suspense <= 0 and not receipt_only) or not valuation_account_code:
             return []
         # ponytail: one balanced JE per item; receipt and value-only legs remain distinct.
         specs = [
             ("receipt_inventory", valuation_account_code, valuation_account_name, value, "Pemulihan SVL aktual"),
             ("receipt_counterpart", "2103006", "Hutang Suspense", -value, "Suspense penerimaan"),
         ]
-        residual = _round2(suspense - value)
+        residual = 0.0 if receipt_only else _round2(suspense - value)
         if abs(residual) >= 0.01:
             expected = _round2(standard_amount) if standard_amount > 0 else value
             specs.extend([
@@ -9798,7 +9840,10 @@ class SvlDashboardServiceAsync:
                     matched_expense_codes = [product_expense_code]
             keep_problem_only_row = (
                 normalized_pcb_case in {"case3", "case4", "case5"} and bool(problem_balances_for_item)
-            ) or normalized_pcb_case in {"case8a", "case8b", "case9"}
+            ) or normalized_pcb_case in {"case8a", "case8b", "case9"} or (
+                normalized_pcb_case == "case5" and item_row.primary_case == "case5"
+                and bool(item_row.receipt_recovery_evidence.get("without_bill"))
+            )
             if not matched_expense_codes and not keep_problem_only_row:
                 continue
             entry = candidate_meta_by_product_id.setdefault(
@@ -9986,6 +10031,7 @@ class SvlDashboardServiceAsync:
             repair_basis_source = normalize_text(getattr(item_row, "repair_basis_source", ""))
             standard_price = _round2(getattr(item_row, "standard_price", 0.0) or product_info.get("standard_price"))
             recovery_evidence = dict(getattr(item_row, "receipt_recovery_evidence", {}) or {})
+            receipt_only = normalized_pcb_case == "case5" and bool(recovery_evidence.get("without_bill"))
             if normalized_pcb_case in {"case5", "case6"}:
                 repair_basis_amount = _round2(recovery_evidence.get("missing_value"))
                 repair_basis_source = "actual_missing_receipt_svl"
@@ -10010,7 +10056,7 @@ class SvlDashboardServiceAsync:
                 if not problem_balances_by_code and not non_target_hpp_balances_by_code:
                     continue
             elif normalized_pcb_case == "case5":
-                if "2103006" not in problem_balances_by_code:
+                if "2103006" not in problem_balances_by_code and not receipt_only:
                     continue
             elif normalized_pcb_case == "case6":
                 if not has_item_bill:
@@ -10040,6 +10086,9 @@ class SvlDashboardServiceAsync:
             elif normalized_pcb_case in {"case5", "case6"}:
                 review_required_candidate = True
                 review_reason = (
+                    "JE penerimaan belum ada dan Bill belum tersedia. Review SVL, akun kategori, dan jurnal existing; "
+                    "pemulihan hanya Inventory - Suspense, tanpa selisih harga. Suspense menunggu Bill."
+                ) if receipt_only else (
                     "Pemulihan memakai SVL aktual. Review jurnal existing, revaluasi/pemakaian di luar cycle "
                     "dan alokasi perubahan cost; standard cost bukan bukti revaluasi."
                 )
@@ -10087,6 +10136,7 @@ class SvlDashboardServiceAsync:
                     valuation_account_code=valuation_account_code,
                     valuation_account_name=valuation_account_name,
                     standard_amount=_round2(standard_price * float(recovery_evidence.get("missing_qty") or 0)),
+                    receipt_only=receipt_only,
                 )
             elif normalized_pcb_case == "case6":
                 expense_balance = _round2(
@@ -10159,8 +10209,13 @@ class SvlDashboardServiceAsync:
             recovery_blockers = []
             if normalized_pcb_case in {"case5", "case6"}:
                 bill_line_ids = [int(v) for v in meta.get("bill_line_ids", []) if int(v) > 0]
-                if len(bill_line_ids) != 1 or len(meta.get("bill_move_ids", [])) != 1:
+                if not receipt_only and (len(bill_line_ids) != 1 or len(meta.get("bill_move_ids", [])) != 1):
                     recovery_blockers.append("Bill source tidak unik; review alokasi per purchase line.")
+                if receipt_only:
+                    if product_info.get("valuation_method") != "automated" or product_info.get("input_account_code") != "2103006":
+                        recovery_blockers.append("Receipt tanpa Bill memerlukan Automated valuation dan akun input kategori 2103006.")
+                    if has_item_bill or has_item_stj or problem_balances_by_code or hpp_balances_by_code:
+                        recovery_blockers.append("Jurnal existing harus ditelusuri sebelum pemulihan receipt tanpa Bill.")
                 if not recovery_evidence.get("complete") or repair_basis_amount <= 0:
                     recovery_blockers.append("Nilai SVL receipt aktual belum tersedia/non-positive.")
                 if not valuation_account_code:
@@ -10169,7 +10224,7 @@ class SvlDashboardServiceAsync:
                     recovery_blockers.append("Return terkait harus ditelusuri sebelum pemulihan receipt dan alokasi beban.")
                 if abs(inventory_balance) >= 0.01:
                     recovery_blockers.append("Saldo inventory existing harus dicocokkan dengan SVL sebelum pemulihan agar tidak berganda.")
-                if abs(float(recovery_evidence.get("receipt_qty") or 0)-float(item_row.bill_quantity or 0)) >= 0.01:
+                if not receipt_only and abs(float(recovery_evidence.get("receipt_qty") or 0)-float(item_row.bill_quantity or 0)) >= 0.01:
                     recovery_blockers.append("Qty receipt dan bill berbeda; review seluruh receipt/return terkait sebelum alokasi beban.")
                 if problem_balances_by_code.get("1108099"):
                     recovery_blockers.append("Clearing existing harus ditelusuri agar pemulihan tidak berganda.")
@@ -10179,10 +10234,10 @@ class SvlDashboardServiceAsync:
                     planned_lines = []
                 recovery_evidence = dict(recovery_evidence,
                     standard_amount=_round2(standard_price * float(recovery_evidence.get("missing_qty") or 0)),
-                    additional_expense=_round2(problem_balances_by_code.get("2103006", 0)-repair_basis_amount) if normalized_pcb_case == "case5" else 0,
+                    additional_expense=_round2(problem_balances_by_code.get("2103006", 0)-repair_basis_amount) if normalized_pcb_case == "case5" and not receipt_only else 0,
                     bill_expense_account_code=expense_account_codes[0] if len(expense_account_codes) == 1 else "",
-                    cost_change_offset=_round2(standard_price * float(recovery_evidence.get("missing_qty") or 0)-repair_basis_amount),
-                    bill_standard_gap=_round2(problem_balances_by_code.get("2103006", 0)-standard_price * float(recovery_evidence.get("missing_qty") or 0)) if normalized_pcb_case == "case5" else 0,
+                    cost_change_offset=0 if receipt_only else _round2(standard_price * float(recovery_evidence.get("missing_qty") or 0)-repair_basis_amount),
+                    bill_standard_gap=_round2(problem_balances_by_code.get("2103006", 0)-standard_price * float(recovery_evidence.get("missing_qty") or 0)) if normalized_pcb_case == "case5" and not receipt_only else 0,
                     blockers=recovery_blockers)
             selisih_hpp_amount = _round2(
                 next(
